@@ -53,10 +53,11 @@ Compute maps of pressure mismatch from geolocator pressure timeseries. Returns G
 | `time`          | `number[]`           | ✅       |         | [UNIX timestamps](https://en.wikipedia.org/wiki/Unix_time) (seconds since 1970-01-01) |
 | `label`         | `(string\|number)[]` | ✅       |         | Grouping labels for pressure data                                                     |
 | `scale`         | `number`             |          | `10`    | Pixels per degree (10 = 0.1°/~10km, 4 = 0.25°/~30km)                                  |
-| `maxSample`     | `number`             |          | `250`   | Maximum datapoints for computation (randomly sampled)                                 |
+| `maxSample`     | `number`             |          | `250`   | Maximum datapoints sampled per label; `max_sample` is also accepted                    |
 | `margin`        | `number`             |          | `30`    | Altitude error margin in meters (1hPa ≈ 10m)                                          |
 | `includeMask`   | `boolean`            |          | `true`  | Include mask layer in output                                                          |
-| `maskThreshold` | `number`             |          | `0`     | Filter pixels by mask value (0-1, e.g., 0.9 for 90%+ feasibility)                     |
+| `maskThreshold` | `number`             |          | `0.9`   | Filter pixels by mask value (0-1, e.g., 0.9 for 90%+ feasibility)                     |
+| `landDensityThreshold` | `number`       |          | `0`     | Minimum land-density threshold applied to ERA5 pixels                                 |
 
 ### Response Format
 
@@ -357,6 +358,9 @@ Content-Type: application/json
 ---
 
 ## Installation
+
+The map service currently uses the standard Google Earth Engine endpoint rather than
+the high-volume endpoint.
 
 ### Server Setup
 

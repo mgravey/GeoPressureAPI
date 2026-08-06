@@ -102,7 +102,7 @@ class GP_map_v2(GEE_Service):
         geoPotLevel = self.ee.Image("ECMWF/ERA5/HOURLY/20200101T00").select("geopotential")
 
         def addGeopotLand(im):
-            return im.addBands(geoPotLand.updateMask(im.select("temperature_2m").mask()))
+            return im.addBands(geoPotLand)
 
         def addGeopotLevel(im):
             return im.addBands(geoPotLevel)
@@ -169,7 +169,8 @@ class GP_map_v2(GEE_Service):
         maxSample=250,
         margin=30,
         maskThreshold=0.9,
-        dataset="single-levels"
+        dataset="single-levels",
+        landDensityThreshold=0,
     ):
         """
         Generate MSE-based probability maps for geolocator analysis.
@@ -189,6 +190,7 @@ class GP_map_v2(GEE_Service):
             maxSample (int): Maximum samples per label for processing (default: 250)
             margin (float): Altitude tolerance margin in meters (default: 30)
             maskThreshold (float): Probability threshold for masking (default: 0.9)
+            landDensityThreshold (float): Minimum land-density threshold (default: 0)
             
         Returns:
             dict: Contains GeoTIFF URLs, metadata, and processing information
@@ -250,15 +252,20 @@ class GP_map_v2(GEE_Service):
             # Standard sea level temperature [K]
             T0 = 273.15 + 15
 
-            # Randomly sample measurements if too many (computational efficiency)
-            labelFeature = (
-                labelFeature.randomColumn("random").sort("random").limit(maxSample)
-            )
+            # Measurements are sampled locally before this Earth Engine collection
+            # is constructed, avoiding a costly server-side random sort.
 
             # Calculate mean pressure and time range for this label
             pressureMeanSensor = labelFeature.aggregate_mean("pressure")  # Fixed typo: was "presureMeanSesnor"
             start = labelFeature.aggregate_min("system:time_start")
             end = labelFeature.aggregate_max("system:time_start")
+
+            landDensityMask = self.ee.Image(
+                "projects/earthimages4unil/assets/PostDocProjects/rafnuss/watermask"
+            ).lt(1 - landDensityThreshold)
+
+            def filterLand(im):
+                return im.updateMask(landDensityMask)
 
             # Select dataset dynamically
             if dataset.lower() == "single-levels":
@@ -272,7 +279,9 @@ class GP_map_v2(GEE_Service):
             ERA5_pressure = ERA5.filterDate(  # Fixed typo: was "ERA5_pressur"
                 self.ee.Date(start).advance(-1, "hour"),
                 self.ee.Date(end).advance(1, "hour"),
-            ).select(["surface_pressure", "temperature_2m","geopotential"])
+            ).select(["surface_pressure", "temperature_2m", "geopotential"])
+
+            ERA5_pressure = ERA5_pressure.map(filterLand)
 
             # Match each measurement with closest ERA5 timestamp
             era5_labelFeature = self.ee.Join.saveBest(  # Fixed typo: was "era5_llabelFeature"
@@ -386,19 +395,23 @@ class GP_map_v2(GEE_Service):
         ims = {}
 
         def process_label(label_id):
-            """
-            Process one label group in parallel.
-            
-            Args:
-                label_id: Label identifier to process
-                
-            Returns:
-                Tuple of (label_id, computed_image)
-            """
+            """Sample one label locally, then build its Earth Engine graph."""
+            random_generator = numpy.random.default_rng(0)
+            label_measurements = list(
+                filter(lambda x: x[2] == label_id, py_collection)
+            )
+            if len(label_measurements) > maxSample:
+                selected_indices = random_generator.choice(
+                    len(label_measurements),
+                    size=maxSample,
+                    replace=False,
+                )
+                label_measurements = [
+                    label_measurements[index] for index in sorted(selected_indices)
+                ]
+
             feature_collection = self.ee.FeatureCollection(
-                self.ee.List(
-                    list(filter(lambda x: x[2] == label_id, py_collection))
-                ).map(makeFeature)
+                self.ee.List(label_measurements).map(makeFeature)
             )
             return label_id, runMSEmatch(feature_collection)
 
@@ -549,6 +562,11 @@ class GP_map_v2(GEE_Service):
                 maxSample = int(jsonObj["maxSample"])
             except (ValueError, TypeError):
                 return printErrorMessage(timeStamp, "MaxSample should be an integer.")
+        if "max_sample" in jsonObj.keys():
+            try:
+                maxSample = int(jsonObj["max_sample"])
+            except (ValueError, TypeError):
+                return printErrorMessage(timeStamp, "max_sample should be an integer.")
 
         # Parse optional margin parameter
         margin = 30
@@ -567,6 +585,10 @@ class GP_map_v2(GEE_Service):
         maskThreshold = 0.9
         if "maskThreshold" in jsonObj.keys():
             maskThreshold = jsonObj["maskThreshold"]
+
+        landDensityThreshold = 0
+        if "landDensityThreshold" in jsonObj.keys():
+            landDensityThreshold = jsonObj["landDensityThreshold"]
 
         # Calculate output image dimensions
         sizeLon = (E - W) * scale
@@ -640,6 +662,7 @@ class GP_map_v2(GEE_Service):
                 margin,
                 maskThreshold,
                 dataset,
+                landDensityThreshold,
             )
             response = {"status": "success", "taskID": timeStamp, "data": data}
             return (

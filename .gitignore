@@ -128,3 +128,13 @@ dmypy.json
 # Pyre type checker
 .pyre/
 .DS_Store
+
+# Service-account credentials and local debugging artifacts
+gee-api-key.json
+**/gee-api-key.json
+/DOCUMENTATION.md
+/map/local_main.py
+/map/code_editor_debug_run.js
+/map/code_editor_sampling_issue.js
+/postman/
+/scripts/run-map-local.sh
