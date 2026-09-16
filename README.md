@@ -290,9 +290,29 @@ Extract atmospheric variables from ERA5/ERA5-LAND data along a path with optiona
 ### Features
 
 - **Multi-variable extraction**: Any ERA5 atmospheric variables
-- **Dataset options**: ERA5-LAND, ERA5 single-levels, or combined
+- **Dataset options**: ERA5 single-levels (default), ERA5-LAND, or combined
 - **Altitude computation**: When geolocator pressure provided
 - **Parallel processing**: Configurable workers for large datasets
+
+> [!WARNING]
+> **Use `dataset="single-levels"` (the default) whenever you need `altitude`.**
+> ERA5-LAND's `surface_pressure` is not hydrostatically consistent with the orography
+> ERA5-LAND publishes — the two disagree by up to ~10 hPa in steep terrain. The
+> orography term therefore fails to cancel out of the barometric formula and the error
+> passes straight into the retrieved altitude. Measured against 41,653 hourly
+> station-pressure observations from 271 NOAA ISD stations (2–3576 m, Alps, July 2020)
+> — every station-hour where both products have data:
+>
+> | `dataset` | bias | MAE | RMSE |
+> | --------- | ---- | --- | ---- |
+> | `"single-levels"` | −0.6 m | **9.0 m** | 27.4 m |
+> | `"land"` / `"both"` | +2.5 m | **55.3 m** | 76.9 m |
+>
+> `"land"` and `"both"` are retained for backward compatibility and remain fine for
+> variables other than `altitude`. When `pressure` is supplied together with one of
+> them, the response carries an extra `warning` field. ERA5-LAND has no atmospheric
+> analysis of its own — it is forced by ERA5 — so it holds no independent information
+> about absolute altitude.
 
 ### Request Parameters
 
@@ -303,16 +323,17 @@ Extract atmospheric variables from ERA5/ERA5-LAND data along a path with optiona
 | `time`     | `number[]` | ✅       |          | UNIX timestamps (must match coordinate array length)                                           |
 | `variable` | `string[]` | ✅       |          | [ERA5 variable names](https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-land) |
 | `pressure` | `number[]` |          |          | Geolocator pressure (Pascal, enables altitude computation)                                     |
-| `dataset`  | `string`   |          | `"both"` | Data source: `"land"`, `"single-levels"`, or `"both"`                                          |
+| `dataset`  | `string`   |          | `"single-levels"` | Data source: `"single-levels"`, `"land"`, or `"both"`. Use `"single-levels"` for altitude (see warning above) |
 | `workers`  | `number`   |          | `10`     | Parallel processing chunks                                                                     |
 
 ### Response Format
 
 | Field    | Type     | Description                 |
 | -------- | -------- | --------------------------- |
-| `status` | `string` | `"success"` or `"error"`    |
-| `taskID` | `number` | Unique task identifier      |
-| `data`   | `object` | Variable arrays (see below) |
+| `status`  | `string` | `"success"` or `"error"`                                              |
+| `taskID`  | `number` | Unique task identifier                                                |
+| `data`    | `object` | Variable arrays (see below)                                           |
+| `warning` | `string` | _(only present)_ when `altitude` was computed from a `dataset` that cannot support it |
 
 ### Data Object Arrays
 
@@ -333,7 +354,7 @@ Content-Type: application/json
   "lat": [48.5, 48.5, 48.5, 41.6, 41.6],
   "time": [1501113600, 1501115400, 1501117200, 1501745400, 1501747200],
   "variable": ["surface_pressure", "temperature_2m"],
-  "dataset": "land",
+  "dataset": "single-levels",
   "pressure": [98900, 99200, 99400, 100000, 100100],
   "workers": 1
 }
@@ -392,9 +413,27 @@ Content-Type: application/json
 ## Data Sources & Limitations
 
 - **ERA5-LAND**: 1981 to ~3 months from real-time
+- **ERA5 single-levels**: 1940 to ~5 days from real-time
 - **Time resolution**: 1 hour (use closest match for any timestamp)
 - **Spatial coverage**: Global land areas
 - **Coordinate systems**: WGS84 (EPSG:4326)
+
+### Accuracy of retrieved altitude
+
+Validated against real barometers (293 NOAA ISD stations, 2–3576 m, 44,163 hourly
+observations). With `dataset="single-levels"` the error separates into two parts that
+behave very differently:
+
+| Component | Size | Notes |
+| --------- | ---- | ----- |
+| Static per-site offset | median 3.7 m, p90 15 m | station metadata + sub-grid terrain; constant in time |
+| Temporal scatter | median SD **3.1 m**, p90 7.7 m | the actual reanalysis error |
+
+So expect **~3 m for relative altitude changes at a fixed location** and **~10 m mean
+absolute error for absolute altitude**, degrading to tens of metres in steep terrain —
+and that last part is a fixed offset, not noise. Precision is nearly independent of
+flight altitude: de-biased RMSE stays 2–7 m up to 1000 m above the model surface and
+~12 m at 1000–3000 m above it.
 
 For more information, see:
 

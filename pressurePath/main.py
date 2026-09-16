@@ -64,11 +64,14 @@ def pressurePath(request):
 
         Optional:
         - pressure: Geolocator pressure measurements for altitude computation
-        - dataset: "land", "single-levels", or "both" (default)
+        - dataset: "single-levels" (default), "land", or "both". "land" and "both"
+          must not be used when altitude is needed -- ERA5-LAND surface_pressure is
+          not hydrostatically consistent with ERA5-LAND orography.
         - workers: Number of processing chunks (default: 10)
 
     Response Format:
         Success: {"status": "success", "taskID": timestamp, "data": {...}}
+                 plus "warning" when altitude was computed from "land"/"both"
         Error: {"status": "error", "taskID": timestamp, "errorMessage": "...", "advice": "..."}
     """
     # Default CORS headers for cross-origin requests
