@@ -226,7 +226,29 @@ class GP_map_v2(GEE_Service):
         # Combine input arrays into measurement triplets
         py_collection = list(zip(time, pressure, label))
 
-        def runMSEmatch(labelFeature):
+        def sampledHours(measurements):
+            """
+            List the ERA5 hourly timestamps a set of measurements can match.
+
+            The join below pairs each measurement with the closest ERA5 image within
+            one hour, so only the hour below and the hour above each measurement can
+            ever be selected. Returning exactly those keeps the ERA5 collection at
+            most twice the sample size instead of every hour the label spans.
+
+            Args:
+                measurements: [time, pressure, label] triplets, time in UNIX seconds
+
+            Returns:
+                Sorted list of UNIX timestamps in milliseconds
+            """
+            hours = set()
+            for measurement in measurements:
+                floor_hour = int(measurement[0]) // 3600 * 3600
+                hours.add(floor_hour * 1000)
+                hours.add((floor_hour + 3600) * 1000)
+            return sorted(hours)
+
+        def runMSEmatch(labelFeature, hoursNeeded):
             """
             Compute MSE map for a specific label group.
             
@@ -235,6 +257,7 @@ class GP_map_v2(GEE_Service):
             
             Args:
                 labelFeature: Earth Engine FeatureCollection for one label
+                hoursNeeded: ERA5 timestamps (ms) the join can match, from sampledHours()
                 
             Returns:
                 Earth Engine Image with MSE and altitude probability bands
@@ -255,10 +278,8 @@ class GP_map_v2(GEE_Service):
             # Measurements are sampled locally before this Earth Engine collection
             # is constructed, avoiding a costly server-side random sort.
 
-            # Calculate mean pressure and time range for this label
+            # Calculate mean pressure for this label
             pressureMeanSensor = labelFeature.aggregate_mean("pressure")  # Fixed typo: was "presureMeanSesnor"
-            start = labelFeature.aggregate_min("system:time_start")
-            end = labelFeature.aggregate_max("system:time_start")
 
             landDensityMask = self.ee.Image(
                 "projects/earthimages4unil/assets/PostDocProjects/rafnuss/watermask"
@@ -275,10 +296,16 @@ class GP_map_v2(GEE_Service):
             else:
                 ERA5 = self.ERA5Combined
 
-            # Filter ERA5 data by time range (±1 hour buffer)
-            ERA5_pressure = ERA5.filterDate(  # Fixed typo: was "ERA5_pressur"
-                self.ee.Date(start).advance(-1, "hour"),
-                self.ee.Date(end).advance(1, "hour"),
+            # Keep only the hourly images the join below can actually match.
+            #
+            # Filtering by the label's start-to-end date range instead would load every
+            # hour it spans: a 158-day stationary period pulls in 3792 hourly images to
+            # serve at most 250 samples, and the evaluator runs out of memory holding
+            # their band metadata. That limit is hit sooner the more bands an image
+            # carries -- ERA5 single levels has 292 against ERA5-Land's 69 -- which is
+            # why "land" survived long periods while "single-levels" and "both" did not.
+            ERA5_pressure = ERA5.filter(
+                self.ee.Filter.inList("system:time_start", hoursNeeded)
             ).select(["surface_pressure", "temperature_2m", "geopotential"])
 
             ERA5_pressure = ERA5_pressure.map(filterLand)
@@ -413,7 +440,9 @@ class GP_map_v2(GEE_Service):
             feature_collection = self.ee.FeatureCollection(
                 self.ee.List(label_measurements).map(makeFeature)
             )
-            return label_id, runMSEmatch(feature_collection)
+            return label_id, runMSEmatch(
+                feature_collection, sampledHours(label_measurements)
+            )
 
         # Process all labels in parallel (single worker to avoid EE quota issues)
         with ThreadPoolExecutor(max_workers=1) as executor:
