@@ -20,6 +20,24 @@ from GEE_API_server import GEE_Service
 # Get number of CPU cores for parallel processing
 numCores = os.cpu_count()
 
+# Datasets whose altitude output cannot be trusted. ERA5-LAND's surface_pressure is not
+# the exact hydrostatic image of the orography ERA5-LAND publishes: the two disagree by
+# up to ~10 hPa in steep terrain. The orography term therefore does not cancel out of the
+# barometric formula, and the retrieved altitude inherits the whole discrepancy.
+# Validated against 41653 hourly station-pressure observations from 271 NOAA ISD stations
+# (2-3576 m, Alps, July 2020): mean absolute error 9.0 m for "single-levels" against
+# 55.3 m for "land". ERA5-LAND has no atmospheric analysis of its own -- it is forced by
+# ERA5 -- so it carries no independent information about absolute altitude.
+DATASET_ALTITUDE_UNSAFE = ("land", "both")
+
+DATASET_ALTITUDE_WARNING = (
+    'dataset="{}" is not suitable for altitude: ERA5-LAND surface_pressure is not '
+    "hydrostatically consistent with ERA5-LAND orography, giving an altitude error of "
+    "tens to hundreds of metres in steep terrain (mean absolute error 55 m against "
+    'station barometers, versus 9 m for dataset="single-levels"). The returned '
+    '"altitude" array should not be used. Use dataset="single-levels" instead.'
+)
+
 
 def printErrorMessage(task_id, errorMessage, adviceMessage="Double check the inputs."):
     """
@@ -156,7 +174,11 @@ class GP_pressurePath(GEE_Service):
             pressure (list, optional): Geolocator pressure values (Pascal)
             variable (list): ERA5 variable names to extract
             nbChunk (int): Number of parallel processing chunks (default: 10)
-            dataset (str): Data source - "land", "single-levels", or "both"
+            dataset (str): Data source - "single-levels" (default), "land", or "both".
+                Use "single-levels" whenever altitude matters: ERA5-LAND's
+                surface_pressure is not hydrostatically consistent with ERA5-LAND's own
+                orography, so "land" and "both" carry an altitude error of up to a few
+                hundred metres in steep terrain. See DATASET_ALTITUDE_WARNING.
 
         Returns:
             dict: Arrays for time, variables, and altitude (if pressure provided)
@@ -206,7 +228,6 @@ class GP_pressurePath(GEE_Service):
             """
 
             # Calculate chunk boundaries
-            chunkSize = (size // nbChunk) + 1
             localVal = val.slice(i * chunkSize, min((i + 1) * chunkSize, size))
             fc = self.ee.FeatureCollection(localVal.map(makeFeature))
 
@@ -325,16 +346,34 @@ class GP_pressurePath(GEE_Service):
             # Store results for this chunk
             results[i] = js.getInfo()
 
-        # Initialize processing
+        # Initialize processing. Chunk sizes must be rounded UP and the chunk count
+        # derived back from them, otherwise the last chunks slice an empty range -- e.g.
+        # 2 points over 2 workers used to give a chunk size of 2, leaving chunk 2 empty,
+        # and aggregate_min on an empty collection yields a null date that Join rejects.
         size = len(path)
+        nbChunk = max(1, min(nbChunk, size))
+        chunkSize = -(-size // nbChunk)  # ceil
+        nbChunk = -(-size // chunkSize)  # ceil; every chunk now holds >= 1 point
         results = [None] * nbChunk
 
-        # Process chunks in parallel
-        with ThreadPoolExecutor(max_workers=min(nbChunk,90)) as executor:
-            executor.map(runComputation4Chunk, list(range(nbChunk)), [val] * nbChunk)
+        # Process chunks in parallel. The futures must be collected and their results
+        # read: ThreadPoolExecutor.map returns a lazy generator, so simply calling it
+        # discards any exception a chunk raised. That used to turn an Earth Engine
+        # failure in one chunk into silently missing points in a "success" response.
+        with ThreadPoolExecutor(max_workers=min(nbChunk, 90)) as executor:
+            futures = [
+                executor.submit(runComputation4Chunk, i, val) for i in range(nbChunk)
+            ]
+            for i, future in enumerate(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    raise Exception(
+                        "Failed to process chunk {} of {}: {}".format(i + 1, nbChunk, e)
+                    ) from e
 
-        # Filter out empty results and combine chunks
-        results = [x for x in results if x is not None]
+        if any(x is None for x in results):
+            raise Exception("Chunk processing returned no data; please retry.")
 
         # Merge all chunk results into single arrays
         return {key: [item for d in results for item in d[key]] for key in results[0]}
@@ -364,7 +403,9 @@ class GP_pressurePath(GEE_Service):
 
         Optional Parameters:
             - pressure: Geolocator pressure measurements
-            - dataset: "land", "single-levels", or "both" (default)
+            - dataset: "single-levels" (default), "land", or "both". "land" and "both"
+              are kept for backward compatibility only and must not be used when
+              altitude is requested; the response then carries a "warning" field.
             - workers: Number of processing chunks (default: 10)
         """
         timeStamp = math.floor(datetime.datetime.utcnow().timestamp())
@@ -403,7 +444,10 @@ class GP_pressurePath(GEE_Service):
         elif "path" in jsonObj.keys():
             path = jsonObj["path"]
 
-        # Process optional dataset parameter
+        # Process optional dataset parameter. "single-levels" is the default because it
+        # is the only one that yields a trustworthy altitude (see
+        # DATASET_ALTITUDE_WARNING); "land" and "both" remain available for callers that
+        # explicitly ask for them.
         dataset = "single-levels"
         if "dataset" in jsonObj.keys():
             if isinstance(jsonObj["dataset"], list):
@@ -436,6 +480,10 @@ class GP_pressurePath(GEE_Service):
                 path, time, pressure, variable, workers, dataset
             )
             response = {"status": "success", "taskID": timeStamp, "data": data}
+            # Altitude from ERA5-LAND is unreliable; say so rather than returning a
+            # plausible-looking number that can be hundreds of metres out.
+            if pressure and dataset.lower() in DATASET_ALTITUDE_UNSAFE:
+                response["warning"] = DATASET_ALTITUDE_WARNING.format(dataset)
             return (
                 200,
                 {"Content-type": "application/json"},
