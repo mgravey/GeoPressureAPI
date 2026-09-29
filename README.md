@@ -384,6 +384,11 @@ Content-Type: application/json
 The map service currently uses the standard Google Earth Engine endpoint rather than
 the high-volume endpoint.
 
+The map service loads only the ERA5 hourly images its samples can actually match (the
+hour below and above each sampled measurement), rather than every hour a label spans.
+Stationary periods of any length therefore cost the same as short ones, for every
+`dataset`.
+
 ### Server Setup
 
 1. **Clone repository**
