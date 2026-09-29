@@ -66,7 +66,8 @@ Compute maps of pressure mismatch from geolocator pressure timeseries. Returns G
 | `status`        | `string`             | `"success"` or `"error"`                       |
 | `taskID`        | `number`             | Unique task identifier                         |
 | `labels`        | `(string\|number)[]` | Unique labels in same order as URLs            |
-| `urls`          | `string[]`           | Download URLs for GeoTIFF files                |
+| `urls`          | `string[]`           | Download URLs for GeoTIFF files (`null` on failure) |
+| `errors`        | `(string\|null)[]`   | Reason each `null` url failed, same order as `urls` |
 | `resolution`    | `number`             | Map resolution in degrees                      |
 | `size`          | `number[]`           | Map dimensions [width, height]                 |
 | `bbox`          | `object`             | Bounding box coordinates                       |

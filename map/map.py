@@ -95,6 +95,8 @@ class GP_map_v2(GEE_Service):
         
         # Get the last available timestamp for ERA5 data to validate requests
         self.endERA5 = 1
+        self.endERA5_land = 1
+        self.endERA5_single = 1
        # Load reference geopotential and DEM data
         geoPotLand = self.ee.Image(
             "projects/earthimages4unil/assets/PostDocProjects/rafnuss/Geopot_ERA5"
@@ -146,12 +148,39 @@ class GP_map_v2(GEE_Service):
         self.era5_land = era5_land
         self.era5_single = era5_single
 
-        # Keep the endERA5 timestamp check
-        self.endERA5 = (
+        # Last available timestamp, per dataset. The availability check has to match
+        # the collection that is actually queried: the two collections do not end at
+        # the same date, so gating everything on Land either rejects a
+        # single-levels request that could be served, or lets one through that
+        # returns empty maps.
+        self.endERA5_land = (
             self.era5_land.filterDate("2024", "2100")
             .aggregate_max("system:time_start")
             .getInfo()
         )
+        self.endERA5_single = (
+            self.era5_single.filterDate("2024", "2100")
+            .aggregate_max("system:time_start")
+            .getInfo()
+        )
+        # "both" joins the two collections, so it ends with the earlier of the two.
+        self.endERA5 = min(self.endERA5_land, self.endERA5_single)
+
+    def getEndERA5(self, dataset):
+        """
+        Last available ERA5 timestamp for the dataset actually queried.
+
+        Args:
+            dataset (str): "land", "single-levels" or "both"
+
+        Returns:
+            int: UNIX timestamp in milliseconds
+        """
+        if str(dataset).lower() == "single-levels":
+            return self.endERA5_single
+        if str(dataset).lower() == "land":
+            return self.endERA5_land
+        return self.endERA5
 
 
     def getMSE_Map(
@@ -393,6 +422,7 @@ class GP_map_v2(GEE_Service):
         listLabel_py = list(set(label))
         urls = {}
         ims = {}
+        errors = {}
 
         def process_label(label_id):
             """Sample one label locally, then build its Earth Engine graph."""
@@ -447,8 +477,10 @@ class GP_map_v2(GEE_Service):
                 except Exception as e:
                     print(f"Error generating URL for label {label_id}: {e}")
                     urls[label_id] = None
+                    errors[label_id] = str(e)
             else:
                 urls[label_id] = None
+                errors[label_id] = "No image was computed for this label."
             end_time = tm.time()
 
         # Generate download URLs in parallel
@@ -461,6 +493,7 @@ class GP_map_v2(GEE_Service):
             "format": "GEOTIFF",
             "labels": listLabel_py,
             "urls": [urls[label_id] for label_id in listLabel_py],
+            "errors": [errors.get(label_id) for label_id in listLabel_py],
             "resolution": 1 / scaleFactor,
             "bbox": {"W": W, "S": S, "E": E, "N": N},
             "size": boxSize,
@@ -629,8 +662,10 @@ class GP_map_v2(GEE_Service):
             )
 
         try:
-            # Check if requested time range is within ERA5 data availability
-            if numpy.array(time).max() * 1000 > self.endERA5:
+            # Check if requested time range is within ERA5 data availability, for
+            # the dataset that will actually be queried.
+            endERA5 = self.getEndERA5(dataset)
+            if numpy.array(time).max() * 1000 > endERA5:
                 return (
                     416,
                     {"Content-type": "application/json"},
@@ -638,10 +673,11 @@ class GP_map_v2(GEE_Service):
                         {
                             "status": "error",
                             "taskID": timeStamp,
-                            "errorMessage": "ERA5 data not available from {}. Request only pressure with earlier date.".format(
-                                datetime.datetime.utcfromtimestamp(self.endERA5 / 1000)
+                            "errorMessage": "ERA5 {} data not available from {}. Request only pressure with earlier date.".format(
+                                dataset,
+                                datetime.datetime.utcfromtimestamp(endERA5 / 1000),
                             ),
-                            "lastERA5": self.endERA5,
+                            "lastERA5": endERA5,
                         }
                     ),
                 )
