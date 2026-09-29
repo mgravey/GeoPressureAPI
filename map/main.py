@@ -16,7 +16,7 @@ import tempfile
 from map import *
 
 # Configuration
-highVolumeEndpoint = True  # Fixed typo: was "hightVolumeEndpoint"
+highVolumeEndpoint = False  # Fixed typo: was "hightVolumeEndpoint"
 
 # Load Google Earth Engine credentials from environment variables
 gee_api_key_content = (

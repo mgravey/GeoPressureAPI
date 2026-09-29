@@ -10,6 +10,20 @@ and uncertainty quantification.
 Author: GeoPressure Team
 """
 
+# import os
+# import logging
+# import http.client as http_client
+
+# http_client.HTTPConnection.debuglevel = 1
+
+# logging.basicConfig(level=logging.DEBUG)
+
+# logging.getLogger("urllib3").setLevel(logging.DEBUG)
+# logging.getLogger("urllib3").propagate = True
+# logging.getLogger("requests").setLevel(logging.DEBUG)
+# logging.getLogger("google.auth").setLevel(logging.DEBUG)
+# logging.getLogger("google.api_core").setLevel(logging.DEBUG)
+
 import datetime
 import json
 import math
@@ -81,16 +95,22 @@ class GP_map_v2(GEE_Service):
         
         # Get the last available timestamp for ERA5 data to validate requests
         self.endERA5 = 1
+        self.endERA5_land = 1
+        self.endERA5_single = 1
        # Load reference geopotential and DEM data
-        geoPot = self.ee.Image(
+        geoPotLand = self.ee.Image(
             "projects/earthimages4unil/assets/PostDocProjects/rafnuss/Geopot_ERA5"
         ).multiply(9.80665).rename("geopotential")
+        geoPotLevel = self.ee.Image("ECMWF/ERA5/HOURLY/20200101T00").select("geopotential")
 
-        def addGeopot(im):
-            return im.addBands(geoPot.updateMask(im.select("temperature_2m").mask()))
+        def addGeopotLand(im):
+            return im.addBands(geoPotLand)
 
-        era5_land = self.ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY").map(addGeopot)
-        era5_single = self.ee.ImageCollection("ECMWF/ERA5/HOURLY")
+        def addGeopotLevel(im):
+            return im.addBands(geoPotLevel)
+
+        era5_land = self.ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY").map(addGeopotLand)
+        era5_single = self.ee.ImageCollection("ECMWF/ERA5/HOURLY").map(addGeopotLevel)
 
         # Rename hourly suffix to avoid band conflicts
         strToRemove = self.ee.String("_hourly")
@@ -128,12 +148,39 @@ class GP_map_v2(GEE_Service):
         self.era5_land = era5_land
         self.era5_single = era5_single
 
-        # Keep the endERA5 timestamp check
-        self.endERA5 = (
-            self.era5_land.filterDate("2022", "2100")
+        # Last available timestamp, per dataset. The availability check has to match
+        # the collection that is actually queried: the two collections do not end at
+        # the same date, so gating everything on Land either rejects a
+        # single-levels request that could be served, or lets one through that
+        # returns empty maps.
+        self.endERA5_land = (
+            self.era5_land.filterDate("2024", "2100")
             .aggregate_max("system:time_start")
             .getInfo()
         )
+        self.endERA5_single = (
+            self.era5_single.filterDate("2024", "2100")
+            .aggregate_max("system:time_start")
+            .getInfo()
+        )
+        # "both" joins the two collections, so it ends with the earlier of the two.
+        self.endERA5 = min(self.endERA5_land, self.endERA5_single)
+
+    def getEndERA5(self, dataset):
+        """
+        Last available ERA5 timestamp for the dataset actually queried.
+
+        Args:
+            dataset (str): "land", "single-levels" or "both"
+
+        Returns:
+            int: UNIX timestamp in milliseconds
+        """
+        if str(dataset).lower() == "single-levels":
+            return self.endERA5_single
+        if str(dataset).lower() == "land":
+            return self.endERA5_land
+        return self.endERA5
 
 
     def getMSE_Map(
@@ -151,7 +198,8 @@ class GP_map_v2(GEE_Service):
         maxSample=250,
         margin=30,
         maskThreshold=0.9,
-        dataset="land"
+        dataset="single-levels",
+        landDensityThreshold=0,
     ):
         """
         Generate MSE-based probability maps for geolocator analysis.
@@ -171,6 +219,7 @@ class GP_map_v2(GEE_Service):
             maxSample (int): Maximum samples per label for processing (default: 250)
             margin (float): Altitude tolerance margin in meters (default: 30)
             maskThreshold (float): Probability threshold for masking (default: 0.9)
+            landDensityThreshold (float): Minimum land-density threshold (default: 0)
             
         Returns:
             dict: Contains GeoTIFF URLs, metadata, and processing information
@@ -232,15 +281,20 @@ class GP_map_v2(GEE_Service):
             # Standard sea level temperature [K]
             T0 = 273.15 + 15
 
-            # Randomly sample measurements if too many (computational efficiency)
-            labelFeature = (
-                labelFeature.randomColumn("random").sort("random").limit(maxSample)
-            )
+            # Measurements are sampled locally before this Earth Engine collection
+            # is constructed, avoiding a costly server-side random sort.
 
             # Calculate mean pressure and time range for this label
             pressureMeanSensor = labelFeature.aggregate_mean("pressure")  # Fixed typo: was "presureMeanSesnor"
             start = labelFeature.aggregate_min("system:time_start")
             end = labelFeature.aggregate_max("system:time_start")
+
+            landDensityMask = self.ee.Image(
+                "projects/earthimages4unil/assets/PostDocProjects/rafnuss/watermask"
+            ).lt(1 - landDensityThreshold)
+
+            def filterLand(im):
+                return im.updateMask(landDensityMask)
 
             # Select dataset dynamically
             if dataset.lower() == "single-levels":
@@ -254,7 +308,9 @@ class GP_map_v2(GEE_Service):
             ERA5_pressure = ERA5.filterDate(  # Fixed typo: was "ERA5_pressur"
                 self.ee.Date(start).advance(-1, "hour"),
                 self.ee.Date(end).advance(1, "hour"),
-            ).select(["surface_pressure", "temperature_2m","geopotential"])
+            ).select(["surface_pressure", "temperature_2m", "geopotential"])
+
+            ERA5_pressure = ERA5_pressure.map(filterLand)
 
             # Match each measurement with closest ERA5 timestamp
             era5_labelFeature = self.ee.Join.saveBest(  # Fixed typo: was "era5_llabelFeature"
@@ -366,21 +422,26 @@ class GP_map_v2(GEE_Service):
         listLabel_py = list(set(label))
         urls = {}
         ims = {}
+        errors = {}
 
         def process_label(label_id):
-            """
-            Process one label group in parallel.
-            
-            Args:
-                label_id: Label identifier to process
-                
-            Returns:
-                Tuple of (label_id, computed_image)
-            """
+            """Sample one label locally, then build its Earth Engine graph."""
+            random_generator = numpy.random.default_rng(0)
+            label_measurements = list(
+                filter(lambda x: x[2] == label_id, py_collection)
+            )
+            if len(label_measurements) > maxSample:
+                selected_indices = random_generator.choice(
+                    len(label_measurements),
+                    size=maxSample,
+                    replace=False,
+                )
+                label_measurements = [
+                    label_measurements[index] for index in sorted(selected_indices)
+                ]
+
             feature_collection = self.ee.FeatureCollection(
-                self.ee.List(
-                    list(filter(lambda x: x[2] == label_id, py_collection))
-                ).map(makeFeature)
+                self.ee.List(label_measurements).map(makeFeature)
             )
             return label_id, runMSEmatch(feature_collection)
 
@@ -416,8 +477,10 @@ class GP_map_v2(GEE_Service):
                 except Exception as e:
                     print(f"Error generating URL for label {label_id}: {e}")
                     urls[label_id] = None
+                    errors[label_id] = str(e)
             else:
                 urls[label_id] = None
+                errors[label_id] = "No image was computed for this label."
             end_time = tm.time()
 
         # Generate download URLs in parallel
@@ -430,6 +493,7 @@ class GP_map_v2(GEE_Service):
             "format": "GEOTIFF",
             "labels": listLabel_py,
             "urls": [urls[label_id] for label_id in listLabel_py],
+            "errors": [errors.get(label_id) for label_id in listLabel_py],
             "resolution": 1 / scaleFactor,
             "bbox": {"W": W, "S": S, "E": E, "N": N},
             "size": boxSize,
@@ -531,6 +595,11 @@ class GP_map_v2(GEE_Service):
                 maxSample = int(jsonObj["maxSample"])
             except (ValueError, TypeError):
                 return printErrorMessage(timeStamp, "MaxSample should be an integer.")
+        if "max_sample" in jsonObj.keys():
+            try:
+                maxSample = int(jsonObj["max_sample"])
+            except (ValueError, TypeError):
+                return printErrorMessage(timeStamp, "max_sample should be an integer.")
 
         # Parse optional margin parameter
         margin = 30
@@ -549,6 +618,10 @@ class GP_map_v2(GEE_Service):
         maskThreshold = 0.9
         if "maskThreshold" in jsonObj.keys():
             maskThreshold = jsonObj["maskThreshold"]
+
+        landDensityThreshold = 0
+        if "landDensityThreshold" in jsonObj.keys():
+            landDensityThreshold = jsonObj["landDensityThreshold"]
 
         # Calculate output image dimensions
         sizeLon = (E - W) * scale
@@ -574,7 +647,7 @@ class GP_map_v2(GEE_Service):
         label = jsonObj["label"]
 
         # Optional dataset selector ("land", "single-levels", or "both")
-        dataset = "land"
+        dataset = "single-levels"
         if "dataset" in jsonObj.keys():
             dataset_val = jsonObj["dataset"]
             if isinstance(dataset_val, list) and len(dataset_val) > 0:
@@ -589,8 +662,10 @@ class GP_map_v2(GEE_Service):
             )
 
         try:
-            # Check if requested time range is within ERA5 data availability
-            if numpy.array(time).max() * 1000 > self.endERA5:
+            # Check if requested time range is within ERA5 data availability, for
+            # the dataset that will actually be queried.
+            endERA5 = self.getEndERA5(dataset)
+            if numpy.array(time).max() * 1000 > endERA5:
                 return (
                     416,
                     {"Content-type": "application/json"},
@@ -598,10 +673,11 @@ class GP_map_v2(GEE_Service):
                         {
                             "status": "error",
                             "taskID": timeStamp,
-                            "errorMessage": "ERA5 data not available from {}. Request only pressure with earlier date.".format(
-                                datetime.datetime.utcfromtimestamp(self.endERA5 / 1000)
+                            "errorMessage": "ERA5 {} data not available from {}. Request only pressure with earlier date.".format(
+                                dataset,
+                                datetime.datetime.utcfromtimestamp(endERA5 / 1000),
                             ),
-                            "lastERA5": self.endERA5,
+                            "lastERA5": endERA5,
                         }
                     ),
                 )
@@ -622,6 +698,7 @@ class GP_map_v2(GEE_Service):
                 margin,
                 maskThreshold,
                 dataset,
+                landDensityThreshold,
             )
             response = {"status": "success", "taskID": timeStamp, "data": data}
             return (
