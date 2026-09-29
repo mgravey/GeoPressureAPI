@@ -610,7 +610,7 @@ class GP_map_v2(GEE_Service):
             return printErrorMessage(timeStamp, "N is not a valid float number.")
 
         # Parse optional scale parameter
-        scale = 10
+        scale = 4
         if "scale" in jsonObj.keys():
             try:
                 scale = float(jsonObj["scale"])
